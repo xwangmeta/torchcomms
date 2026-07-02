@@ -6,6 +6,7 @@
 #include <fmt/core.h>
 #include <gtest/gtest.h>
 #include <nccl.h>
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -197,6 +198,84 @@ void printBf16HopBytes(
       "REDUCTION_NUMERICAL_BF16HOP", bf16Hop, rank, collectiveName, caseName);
 }
 
+// Aggregate error metrics comparing the NCCL output against the FP64 reference.
+// These complement the elementwise allclose check with whole-vector signals
+// that can carry tighter, more meaningful bounds than any single element (for
+// example relative L2 error and cosine similarity between the output and the
+// reference).
+struct AggregateMetrics {
+  double relativeL2Error{0.0}; // ||actual - ref||_2 / ||ref||_2
+  double cosineSimilarity{1.0}; // dot(actual, ref) / (||actual|| * ||ref||)
+  double maxAbsError{0.0}; // max_i |actual_i - ref_i|
+  double maxRelError{0.0}; // max_i |actual_i - ref_i| / |ref_i|, ref_i != 0
+};
+
+// Degenerate-case handling (report-only diagnostics; the elementwise allclose
+// check remains the pass/fail gate):
+//   - relativeL2Error is NaN when the reference is all-zero (relative error is
+//     undefined); max_abs_error still reports the absolute divergence.
+//   - cosineSimilarity is 1.0 only when both vectors are all-zero, and 0.0 when
+//     exactly one is all-zero, so a zero-vs-nonzero mismatch is not masked as
+//     perfect similarity.
+//   - maxRelError skips ref_i == 0 (relative error undefined there); such
+//     divergence is reflected by max_abs_error and relativeL2Error instead.
+template <typename T>
+AggregateMetrics computeAggregateMetrics(
+    const std::vector<T>& observed,
+    const std::vector<double>& reference) {
+  // Precondition: observed provides at least one entry per reference element.
+  assert(observed.size() >= reference.size());
+  double diffSq = 0.0;
+  double refSq = 0.0;
+  double actualSq = 0.0;
+  double dot = 0.0;
+  double maxAbs = 0.0;
+  double maxRel = 0.0;
+  for (size_t i = 0; i < reference.size(); ++i) {
+    const double actual =
+        static_cast<double>(DataTypeTraits<T>::toHost(observed[i]));
+    const double ref = reference[i];
+    const double absError = std::abs(actual - ref);
+    diffSq += absError * absError;
+    refSq += ref * ref;
+    actualSq += actual * actual;
+    dot += actual * ref;
+    maxAbs = absError > maxAbs ? absError : maxAbs;
+    if (ref != 0.0) {
+      const double relError = absError / std::abs(ref);
+      maxRel = relError > maxRel ? relError : maxRel;
+    }
+  }
+  AggregateMetrics metrics;
+  // Relative L2 is undefined for an all-zero reference; report NaN rather than
+  // an absolute value under the relative_l2 field. max_abs_error still captures
+  // the divergence in that case.
+  metrics.relativeL2Error =
+      refSq > 0.0 ? std::sqrt(diffSq) / std::sqrt(refSq) : std::nan("");
+  const double norms = std::sqrt(actualSq) * std::sqrt(refSq);
+  // Only truly-identical all-zero vectors are perfectly similar; a zero-vs-
+  // nonzero pair is maximal disagreement, not cosine 1.0.
+  metrics.cosineSimilarity =
+      norms > 0.0 ? dot / norms : (actualSq == 0.0 && refSq == 0.0 ? 1.0 : 0.0);
+  metrics.maxAbsError = maxAbs;
+  metrics.maxRelError = maxRel;
+  return metrics;
+}
+
+inline void printAggregateMetrics(
+    const AggregateMetrics& metrics,
+    int rank,
+    const std::string& caseName) {
+  std::cout << "REDUCTION_NUMERICAL_AGGREGATE case=" << caseName
+            << " rank=" << rank << " relative_l2_error="
+            << fmt::format("{:.6g}", metrics.relativeL2Error)
+            << " cosine_similarity="
+            << fmt::format("{:.9g}", metrics.cosineSimilarity)
+            << " max_abs_error=" << fmt::format("{:.6g}", metrics.maxAbsError)
+            << " max_rel_error=" << fmt::format("{:.6g}", metrics.maxRelError)
+            << std::endl;
+}
+
 template <typename T>
 size_t countMismatches(
     const T* deviceBuffer,
@@ -238,6 +317,13 @@ size_t countMismatches(
       }
       mismatches++;
     }
+  }
+  // Aggregate metrics are diagnostics only; they do not affect the elementwise
+  // pass/fail gate. Emit them on failure and whenever output diagnostics are
+  // on.
+  if (mismatches > 0 || shouldPrintActualOutput()) {
+    printAggregateMetrics(
+        computeAggregateMetrics(observed, reference), rank, caseName);
   }
   return mismatches;
 }
